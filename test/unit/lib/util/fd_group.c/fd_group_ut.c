@@ -7,9 +7,19 @@
 #include "spdk_internal/cunit.h"
 #include "util/fd_group.c"
 
+#include <sys/timerfd.h>
+
+static bool g_fd_group_cb_fn_called = false;
+static int g_expected_cb_arg = 0;
+
 static int
 fd_group_cb_fn(void *ctx)
 {
+	int *cb_arg = ctx;
+
+	SPDK_CU_ASSERT_FATAL(*cb_arg == g_expected_cb_arg);
+	SPDK_CU_ASSERT_FATAL(!g_fd_group_cb_fn_called);
+	g_fd_group_cb_fn_called = true;
 	return 0;
 }
 
@@ -18,39 +28,94 @@ test_fd_group_basic(void)
 {
 	struct spdk_fd_group *fgrp;
 	struct event_handler *ehdlr = NULL;
-	int fd;
+	int fd1, fd2;
 	int rc;
-	int cb_arg;
+	int cb_arg1 = 1;
+	int cb_arg2 = 2;
+	uint64_t val = 1;
+	struct spdk_event_handler_opts eh_opts;
+	struct itimerspec ts;
 
 	rc = spdk_fd_group_create(&fgrp);
 	SPDK_CU_ASSERT_FATAL(rc == 0);
 
-	fd = epoll_create1(0);
-	SPDK_CU_ASSERT_FATAL(fd >= 0);
+	fd1 = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+	SPDK_CU_ASSERT_FATAL(fd1 >= 0);
 
-	rc = SPDK_FD_GROUP_ADD(fgrp, fd, fd_group_cb_fn, &cb_arg);
+	eh_opts.opts_size = sizeof(eh_opts);
+	eh_opts.events = EPOLLIN;
+	eh_opts.fd_type = SPDK_FD_TYPE_EVENTFD;
+	rc = SPDK_FD_GROUP_ADD_EXT(fgrp, fd1, fd_group_cb_fn, &cb_arg1, &eh_opts);
 	SPDK_CU_ASSERT_FATAL(rc == 0);
 	SPDK_CU_ASSERT_FATAL(fgrp->num_fds == 1);
 
-	/* Verify that event handler is initialized correctly */
+	/* Verify that event handler 1 is initialized correctly */
 	ehdlr = TAILQ_FIRST(&fgrp->event_handlers);
 	SPDK_CU_ASSERT_FATAL(ehdlr != NULL);
-	CU_ASSERT(ehdlr->fd == fd);
+	CU_ASSERT(ehdlr->fd == fd1);
 	CU_ASSERT(ehdlr->state == EVENT_HANDLER_STATE_WAITING);
 	CU_ASSERT(ehdlr->events == EPOLLIN);
 
+	fd2 = timerfd_create(CLOCK_REALTIME, TFD_NONBLOCK | TFD_CLOEXEC);
+	SPDK_CU_ASSERT_FATAL(fd2 >= 0);
+
+	rc = SPDK_FD_GROUP_ADD(fgrp, fd2, fd_group_cb_fn, &cb_arg2);
+	SPDK_CU_ASSERT_FATAL(rc == 0);
+	SPDK_CU_ASSERT_FATAL(fgrp->num_fds == 2);
+
+	/* Verify that event handler 2 is initialized correctly */
+	ehdlr = TAILQ_FIRST(&fgrp->event_handlers);
+	ehdlr = TAILQ_NEXT(ehdlr, next);
+	SPDK_CU_ASSERT_FATAL(ehdlr != NULL);
+	CU_ASSERT(ehdlr->fd == fd2);
+	CU_ASSERT(ehdlr->state == EVENT_HANDLER_STATE_WAITING);
+	CU_ASSERT(ehdlr->events == EPOLLIN);
+
+	/* Verify that the event handler 1 is called when its fd is set */
+	g_fd_group_cb_fn_called = false;
+	g_expected_cb_arg = cb_arg1;
+	rc = write(fd1, &val, sizeof(val));
+	SPDK_CU_ASSERT_FATAL(rc == sizeof(val));
+
+	rc = spdk_fd_group_wait(fgrp, 0);
+	SPDK_CU_ASSERT_FATAL(rc == 1);
+	SPDK_CU_ASSERT_FATAL(g_fd_group_cb_fn_called);
+
 	/* Modify event type and see if event handler is updated correctly */
-	rc = spdk_fd_group_event_modify(fgrp, fd, EPOLLIN | EPOLLERR);
+	rc = spdk_fd_group_event_modify(fgrp, fd1, EPOLLIN | EPOLLERR);
 	SPDK_CU_ASSERT_FATAL(rc == 0);
 
 	ehdlr = TAILQ_FIRST(&fgrp->event_handlers);
 	SPDK_CU_ASSERT_FATAL(ehdlr != NULL);
 	CU_ASSERT(ehdlr->events == (EPOLLIN | EPOLLERR));
 
-	spdk_fd_group_remove(fgrp, fd);
+	/* Verify that the event handler 2 is not called after it is removed */
+	g_fd_group_cb_fn_called = false;
+	g_expected_cb_arg = cb_arg2;
+	ts.it_interval.tv_sec = 0;
+	ts.it_interval.tv_nsec = 100000000;
+	ts.it_value.tv_sec = 0;
+	ts.it_value.tv_nsec = 0;
+	rc = timerfd_settime(fd2, 0, &ts, NULL);
+	SPDK_CU_ASSERT_FATAL(rc == 0);
+
+	spdk_fd_group_remove(fgrp, fd2);
+	SPDK_CU_ASSERT_FATAL(fgrp->num_fds == 1);
+
+	/* Simulate pointing to free memory */
+	cb_arg2 = 0xDEADBEEF;
+
+	rc = spdk_fd_group_wait(fgrp, 0);
+	SPDK_CU_ASSERT_FATAL(rc == 0);
+	SPDK_CU_ASSERT_FATAL(!g_fd_group_cb_fn_called);
+
+	rc = close(fd2);
+	CU_ASSERT(rc == 0);
+
+	spdk_fd_group_remove(fgrp, fd1);
 	SPDK_CU_ASSERT_FATAL(fgrp->num_fds == 0);
 
-	rc = close(fd);
+	rc = close(fd1);
 	CU_ASSERT(rc == 0);
 
 	spdk_fd_group_destroy(fgrp);
